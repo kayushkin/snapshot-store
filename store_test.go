@@ -3,7 +3,9 @@ package snapshotstore
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -367,4 +369,56 @@ func TestMigrateV2FromV1(t *testing.T) {
 	if err != nil || len(snaps) != 2 {
 		t.Fatalf("expected 2 snaps, got %d (%v)", len(snaps), err)
 	}
+}
+
+// The phase column is guarded twice: by Capture's own check and by
+// CHECK (phase IN ('before','after')) in the schema. Nothing pinned either one.
+// Asserting only that Capture failed would not tell them apart, and the schema
+// wins by answering last — so assert the wording only Capture produces, and
+// assert it names the offending value.
+func TestCaptureRefusesAPhaseTheSchemaWouldAlsoRefuse(t *testing.T) {
+	s := newStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	writeFile(t, path, []byte("hello"))
+
+	_, err := s.Capture("sess1", "tool1", Phase("during"), path)
+	if err == nil {
+		t.Fatal("expected Capture to refuse a phase that is neither before nor after")
+	}
+	if !strings.Contains(err.Error(), "snapshotstore: invalid phase") {
+		t.Fatalf("the refusal should be Capture's own, not the driver's CHECK constraint; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `"during"`) {
+		t.Fatalf("the refusal should name the offending phase so the caller can act on it; got: %v", err)
+	}
+}
+
+// Capture must refuse a bad phase BEFORE it does any work: an invalid phase is
+// a caller bug, not a reason to read the file, write a blob and let the
+// database reject the row several layers later. "It returned an error" cannot
+// show this — the CHECK constraint returns one too. Counting blobs can.
+func TestABadPhaseWritesNoBlob(t *testing.T) {
+	s := newStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	writeFile(t, path, []byte("content worth storing"))
+
+	before := countBlobs(t, s.GitDir())
+	if _, err := s.Capture("sess1", "tool1", Phase("during"), path); err == nil {
+		t.Fatal("expected a bad phase to be refused")
+	}
+	if after := countBlobs(t, s.GitDir()); after != before {
+		t.Fatalf("a refused capture stored %d blob(s): the phase was checked after the file was read, not before", after-before)
+	}
+}
+
+// countBlobs reports how many objects the bare blob repo holds.
+func countBlobs(t *testing.T, gitDir string) int {
+	t.Helper()
+	out, err := exec.Command("git", "--git-dir", gitDir, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)").Output()
+	if err != nil {
+		t.Fatalf("list blob objects: %v", err)
+	}
+	return len(bytes.Fields(out))
 }
